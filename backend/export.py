@@ -19,6 +19,7 @@ FZ_ST = "方正书宋_GBK"
 FZ_HT = "方正黑体_GBK"
 FZ_KT = "方正楷体_GBK"
 FZ_XBS = "方正小标宋简体"
+CN_FONTS = ["方正书宋_GBK", "宋体", "SimSun"]
 
 X2 = Pt(18)     # 小二号
 X4 = Pt(12)     # 小四号
