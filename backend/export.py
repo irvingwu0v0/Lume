@@ -14,6 +14,7 @@ from pptx.dml.color import RGBColor as PptRGBColor
 from pptx.oxml.ns import qn as pptx_qn
 # ── Shared Constants ──────────────────────────────────────
 
+PPT_TEMPLATE = "templates/ppt_template.pptx"
 TNR = "Times New Roman"
 FZ_ST = "方正书宋_GBK"
 FZ_HT = "方正黑体_GBK"
