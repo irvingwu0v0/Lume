@@ -8,6 +8,13 @@ construction live in exactly one place.
 import json
 
 
+def strip_code_fence(text):
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[-1]
+    return stripped.rstrip("`").strip()
+
+
 def extract_json(text):
     """Robustly extract a JSON object from AI-generated text.
 
