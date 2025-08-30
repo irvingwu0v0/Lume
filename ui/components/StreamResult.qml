@@ -15,6 +15,7 @@ Frame {
     property string status: ""
     property bool generating: false
     property bool thinkExpanded: true
+    property bool autoScroll: true
 
     readonly property string content: _content
     readonly property string thinking: _thinking
