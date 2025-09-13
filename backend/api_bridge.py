@@ -217,7 +217,8 @@ class AsrWorker(QThread):
 
     def _run_asr(self):
         BCUT_API = "https://member.bilibili.com/x/bcut/rubick-interface"
-        BCUT_HEADERS = {
+        OCR_HTTP_TIMEOUT = 60
+BCUT_HEADERS = {
             "User-Agent": "Bilibili/1.0.0 (https://www.bilibili.com)",
             "Content-Type": "application/json",
         }
