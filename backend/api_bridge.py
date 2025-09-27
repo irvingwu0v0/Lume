@@ -140,7 +140,7 @@ class SseWorker(QThread):
         try:
             resp = requests.post(
                 self.url, json=self.payload, headers=self.headers,
-                stream=True, timeout=600,
+                stream=True, timeout=900,
             )
             resp.raise_for_status()
         except Exception as e:
