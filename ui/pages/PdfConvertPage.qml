@@ -17,6 +17,7 @@ FluentPage {
     property string pdfFileName: ""
     property string pdfMode: "ocr"
     property bool batchMode: false
+    property bool phoneWaiting: false
     property bool splitMode: false
 
     // Phone mode properties
