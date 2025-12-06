@@ -15,6 +15,7 @@ from PySide6.QtWebSockets import QWebSocketServer
 # WS_PORT is used for the real-time WebSocket channel.
 # HTTP_PORT serves a mobile web page as a convenience fallback.
 WS_PORT = 18923
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 HTTP_PORT = 18924
 
 # Mobile web interface served on HTTP_PORT.  It is self-contained so any phone
