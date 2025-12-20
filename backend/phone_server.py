@@ -17,6 +17,7 @@ from PySide6.QtWebSockets import QWebSocketServer
 WS_PORT = 18923
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 HTTP_PORT = 18924
+MAX_IMAGES = 40
 
 # Mobile web interface served on HTTP_PORT.  It is self-contained so any phone
 # browser can open it by visiting http://<desktop-ip>:<http-port>/ .
