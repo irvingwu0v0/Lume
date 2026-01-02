@@ -16,6 +16,7 @@ from PySide6.QtWebSockets import QWebSocketServer
 # HTTP_PORT serves a mobile web page as a convenience fallback.
 WS_PORT = 18923
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+TMP_PREFIX = "phone_"
 HTTP_PORT = 18924
 MAX_IMAGES = 40
 
