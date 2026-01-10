@@ -17,6 +17,7 @@ from PySide6.QtWebSockets import QWebSocketServer
 WS_PORT = 18923
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 TMP_PREFIX = "phone_"
+LAN_PROBE = ("8.8.8.8", 80)
 HTTP_PORT = 18924
 MAX_IMAGES = 40
 
