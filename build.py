@@ -30,6 +30,7 @@ def build():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onedir",
+        "--noconfirm",
         "--name", "Lume",
         "--noconsole",
         "--clean",
