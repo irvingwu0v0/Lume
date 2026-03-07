@@ -9,6 +9,7 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(PROJECT_DIR, "dist")
 BUILD_DIR = os.path.join(PROJECT_DIR, "build")
 ICON = os.path.join(PROJECT_DIR, "baka.ico")
+ASSETS_DIR = os.path.join(PROJECT_DIR, "assets")
 
 
 def clean():
