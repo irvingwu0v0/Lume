@@ -218,6 +218,7 @@ class AsrWorker(QThread):
     def _run_asr(self):
         BCUT_API = "https://member.bilibili.com/x/bcut/rubick-interface"
         OCR_HTTP_TIMEOUT = 60
+PDF_RENDER_SCALE = 2.0
 BCUT_HEADERS = {
             "User-Agent": "Bilibili/1.0.0 (https://www.bilibili.com)",
             "Content-Type": "application/json",
