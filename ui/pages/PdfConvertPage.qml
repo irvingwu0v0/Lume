@@ -19,6 +19,7 @@ FluentPage {
     property bool batchMode: false
     property bool phoneWaiting: false
     property bool splitMode: false
+    property bool visionMode: false
 
     // Phone mode properties
     property bool phoneConnected: false
