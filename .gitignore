@@ -222,5 +222,8 @@ __marimo__/
 # Lume
 data/
 
-#RinUI
+# RinUI
 RinUI/
+
+# 构建产物
+release/
