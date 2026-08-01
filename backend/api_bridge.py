@@ -1,124 +1,18 @@
 import base64
-import hashlib
 import json
 import os
-import re
-import sys
-import tempfile
-import threading
 import time
-import urllib.request
-import urllib.error
+import uuid
 
-import fitz
+import pymupdf
 import requests
 from PySide6.QtCore import QObject, Signal, Slot, QThread
 
-from .data import load_models, save_models, load_config, save_config
+from .chat import (
+    build_chat_request, extract_json, image_content, iter_sse_deltas, validate_http_url,
+)
+from .data import DEFAULT_CONFIG, load_config, load_models, save_config, save_models
 from .phone_server import PhoneServer
-
-
-def extract_json(text):
-    """Robustly extract a JSON dict from AI-generated text.
-    Module-level so both SseWorker/SplitPdfWorker and ApiBridge can use it."""
-    import re as _re
-    if not text or not text.strip():
-        return None, "empty content"
-    t = text.strip()
-
-    # 1) Direct parse
-    try:
-        result = json.loads(t)
-        if isinstance(result, dict):
-            return result, None
-    except Exception:
-        pass
-
-    # 2) Search for JSON fences — prefer the LAST complete code block
-    fences = ["```json\n", "```json", "```JSON\n", "```JSON", "```"]
-    best = None
-    for fence in fences:
-        pos = 0
-        while True:
-            fence_start = t.find(fence, pos)
-            if fence_start == -1:
-                break
-            inner_start = fence_start + len(fence)
-            inner = t[inner_start:]
-            fence_end = inner.find("```")
-            if fence_end == -1:
-                fence_end = len(inner)
-            inner = inner[:fence_end].strip()
-            if inner:
-                try:
-                    result = json.loads(inner)
-                    if isinstance(result, dict):
-                        best = result
-                except Exception:
-                    pass
-            pos = inner_start + fence_end + 3
-
-    if best is not None:
-        return best, None
-
-    # 3) String-aware balanced brace extraction
-    start_pos = t.find("{")
-    if start_pos == -1:
-        return None, "no JSON object found"
-
-    stack = []
-    in_string = False
-    escape_next = False
-    i = start_pos
-    while i < len(t):
-        ch = t[i]
-        if escape_next:
-            escape_next = False
-            i += 1
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            i += 1
-            continue
-        if ch == '"' and not escape_next:
-            in_string = not in_string
-            i += 1
-            continue
-        if in_string:
-            i += 1
-            continue
-        if ch == '{':
-            stack.append('{')
-        elif ch == '}':
-            if stack and stack[-1] == '{':
-                stack.pop()
-                if not stack:
-                    candidate = t[start_pos:i+1]
-                    try:
-                        return json.loads(candidate), None
-                    except Exception:
-                        pass
-        elif ch == '[':
-            stack.append('[')
-        elif ch == ']':
-            if stack and stack[-1] == '[':
-                stack.pop()
-        i += 1
-
-    # 4) Auto-close truncated JSON
-    if stack and len(stack) <= 50:
-        suffix = ""
-        if in_string:
-            suffix += '"'
-        for opener in reversed(stack):
-            suffix += '}' if opener == '{' else ']'
-        candidate = t[start_pos:] + suffix
-        try:
-            return json.loads(candidate), None
-        except Exception:
-            pass
-
-    return None, "could not extract valid JSON"
 
 
 class SseWorker(QThread):
@@ -132,23 +26,26 @@ class SseWorker(QThread):
         self.payload = payload
         self.headers = headers
         self._abort = False
+        self._response = None
 
     def abort(self):
         self._abort = True
+        if self._response is not None:
+            self._response.close()
 
     def run(self):
         try:
             resp = requests.post(
                 self.url, json=self.payload, headers=self.headers,
-                stream=True, timeout=900,
+                stream=True, timeout=600,
             )
             resp.raise_for_status()
+            self._response = resp
         except Exception as e:
             self.error_signal.emit(str(e))
             return
 
         full_content = ""
-        buf = ""
         pending_reasoning = ""
         pending_content = ""
         last_flush = time.monotonic()
@@ -164,37 +61,28 @@ class SseWorker(QThread):
                 pending_content = ""
             last_flush = time.monotonic()
 
-        for chunk in resp.iter_content(chunk_size=None):
-            if self._abort:
-                return
-            if not chunk:
-                continue
-            buf += chunk.decode("utf-8", errors="replace")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
+        try:
+            for reasoning, content in iter_sse_deltas(
+                resp.iter_content(chunk_size=None), lambda: self._abort
+            ):
+                if reasoning:
+                    pending_reasoning += reasoning
+                if content:
+                    full_content += content
+                    pending_content += content
+                if time.monotonic() - last_flush >= FLUSH_INTERVAL:
                     flush()
-                    self.finished_signal.emit(full_content)
-                    return
-                try:
-                    obj = json.loads(data_str)
-                    choices = obj.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        reasoning = delta.get("reasoning_content", "")
-                        content = delta.get("content", "")
-                        if reasoning:
-                            pending_reasoning += reasoning
-                        if content:
-                            full_content += content
-                            pending_content += content
-                        if time.monotonic() - last_flush >= FLUSH_INTERVAL:
-                            flush()
-                except json.JSONDecodeError:
-                    pass
+        except Exception as exc:
+            if not self._abort:
+                self.error_signal.emit(str(exc))
+            return
+        finally:
+            resp.close()
+            self._response = None
+
+        if self._abort:
+            return
+
         flush()
         self.finished_signal.emit(full_content)
 
@@ -207,19 +95,22 @@ class AsrWorker(QThread):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
         try:
             text = self._run_asr()
-            self.done.emit(text)
+            if not self._abort:
+                self.done.emit(text)
         except Exception as e:
             self.error.emit(str(e))
 
     def _run_asr(self):
         BCUT_API = "https://member.bilibili.com/x/bcut/rubick-interface"
-        OCR_HTTP_TIMEOUT = 60
-PDF_RENDER_SCALE = 2.0
-BCUT_HEADERS = {
+        BCUT_HEADERS = {
             "User-Agent": "Bilibili/1.0.0 (https://www.bilibili.com)",
             "Content-Type": "application/json",
         }
@@ -248,6 +139,8 @@ BCUT_HEADERS = {
 
         etags = []
         for clip in range(len(upload_urls)):
+            if self._abort:
+                return ""
             start = clip * per_size
             end = (clip + 1) * per_size
             r = requests.put(
@@ -283,6 +176,8 @@ BCUT_HEADERS = {
         self.progress.emit(60, "正在转写，请稍候...")
 
         for _ in range(500):
+            if self._abort:
+                return ""
             resp = requests.get(
                 BCUT_API + "/task/result",
                 params={"model_id": 8, "task_id": task_id},
@@ -316,11 +211,16 @@ class OcrWorker(QThread):
         self.filepath = filepath
         self.host = host
         self.port = port
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
         try:
             pages = self._run_ocr()
-            self.done.emit(pages)
+            if not self._abort:
+                self.done.emit(pages)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -358,6 +258,8 @@ class OcrWorker(QThread):
         total_pages = 1
 
         while True:
+            if self._abort:
+                return []
             resp = requests.post(
                 f"{base}/api/doc/result",
                 json={"id": task_id, "is_data": True, "format": "text", "is_unread": True},
@@ -402,15 +304,22 @@ class PdfToImagesWorker(QThread):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
         try:
             with open(self.filepath, "rb") as f:
                 pdf_bytes = f.read()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             images = []
             for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                if self._abort:
+                    doc.close()
+                    return
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
                 img_bytes = pix.tobytes("jpeg")
                 b64 = base64.b64encode(img_bytes).decode("utf-8")
                 images.append(b64)
@@ -422,179 +331,129 @@ class PdfToImagesWorker(QThread):
 
 class SplitPdfWorker(QThread):
     """Two-pass AI generation worker for split_mode (OCR) and batch_mode (Vision)."""
+
     chunk_received = Signal(str)
     finished_signal = Signal(str)
     error_signal = Signal(str)
 
-    def __init__(self, base_url, model, data, thinking_enabled, is_vision=False, parent=None):
+    def __init__(self, model, data, thinking_enabled, is_vision=False, parent=None):
         super().__init__(parent)
-        self.base_url = base_url
         self.model = model
         self.data = data
         self.thinking_enabled = thinking_enabled
         self.is_vision = is_vision
         self._abort = False
+        self._response = None
 
     def abort(self):
         self._abort = True
+        if self._response is not None:
+            self._response.close()
+
+    def _flush(self, state):
+        if state["reasoning"]:
+            self.chunk_received.emit(json.dumps({"reasoning": state["reasoning"]}))
+            state["reasoning"] = ""
+        if state["content"]:
+            self.chunk_received.emit(json.dumps({"content": state["content"]}))
+            state["content"] = ""
 
     def _stream_call(self, url, payload, headers):
         full = ""
         try:
             resp = requests.post(url, json=payload, headers=headers, stream=True, timeout=600)
             resp.raise_for_status()
+            self._response = resp
         except Exception as e:
             self.error_signal.emit(str(e))
             return None, str(e)
 
-        pending_reasoning = ""
-        pending_content = ""
-        last_flush = time.monotonic()
+        flush_state = {"reasoning": "", "content": "", "at": time.monotonic()}
         FLUSH_INTERVAL = 0.05
 
-        for chunk in resp.iter_content(chunk_size=None):
-            if self._abort:
-                return full, "aborted"
-            if not chunk:
-                continue
-            for line in chunk.decode("utf-8", errors="replace").split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    if pending_reasoning:
-                        self.chunk_received.emit(json.dumps({"reasoning": pending_reasoning}))
-                    if pending_content:
-                        self.chunk_received.emit(json.dumps({"content": pending_content}))
-                    return full, None
-                try:
-                    obj = json.loads(data_str)
-                    choices = obj.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        reasoning = delta.get("reasoning_content", "")
-                        content = delta.get("content", "")
-                        if reasoning:
-                            pending_reasoning += reasoning
-                        if content:
-                            full += content
-                            pending_content += content
-                        if time.monotonic() - last_flush >= FLUSH_INTERVAL:
-                            if pending_reasoning:
-                                self.chunk_received.emit(json.dumps({"reasoning": pending_reasoning}))
-                                pending_reasoning = ""
-                            if pending_content:
-                                self.chunk_received.emit(json.dumps({"content": pending_content}))
-                                pending_content = ""
-                            last_flush = time.monotonic()
-                except json.JSONDecodeError:
-                    pass
-        if pending_reasoning:
-            self.chunk_received.emit(json.dumps({"reasoning": pending_reasoning}))
-        if pending_content:
-            self.chunk_received.emit(json.dumps({"content": pending_content}))
+        try:
+            for reasoning, content in iter_sse_deltas(
+                resp.iter_content(chunk_size=None), lambda: self._abort
+            ):
+                if reasoning:
+                    flush_state["reasoning"] += reasoning
+                if content:
+                    full += content
+                    flush_state["content"] += content
+                if time.monotonic() - flush_state["at"] >= FLUSH_INTERVAL:
+                    self._flush(flush_state)
+                    flush_state["at"] = time.monotonic()
+        except Exception as exc:
+            if not self._abort:
+                self.error_signal.emit(str(exc))
+            return None, str(exc)
+        finally:
+            resp.close()
+            self._response = None
+
+        if self._abort:
+            return full, "aborted"
+        self._flush(flush_state)
         return full, None
+
+    def _call(self, messages):
+        url, payload, headers = build_chat_request(
+            self.model, messages, self.thinking_enabled, temperature=0.3
+        )
+        return self._stream_call(url, payload, headers)
 
     def run(self):
         from .prompts import PDF_SYSTEM_PROMPT, PDF_VISION_PROMPT
-        thinking_kv = {"type": "enabled"} if self.thinking_enabled else {"type": "disabled"}
-        url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.model['api_key']}",
-        }
 
         if self.is_vision:
-            # Batch mode: split images, two calls
-            images = self.data
-            batch_size = 9
+            # Batch mode: acknowledge the first batch, then send the rest.
             prompt = PDF_VISION_PROMPT
+            first_batch = self.data[:9]
+            remaining = self.data[9:]
 
-            first_batch = images[:batch_size]
-            remaining = images[batch_size:]
-
-            # Call 1: send first batch, ask to acknowledge
-            img_content_1 = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}} for b64 in first_batch]
-            img_content_1.append({"type": "text", "text": "请先识别这些试卷图片的内容，熟悉试卷结构和排版，只输出且仅输出OK，不要输出其他任何内容。"})
-
-            p1_payload = {
-                "model": self.model["model_name"],
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": img_content_1},
-                ],
-                "temperature": 0.3,
-                "stream": True,
-            }
-            p1_payload["thinking"] = thinking_kv
-
-            p1_text, err = self._stream_call(url, p1_payload, headers)
+            ack_content = image_content(
+                first_batch,
+                "请先识别这些试卷图片的内容，熟悉试卷结构和排版，只输出且仅输出OK，不要输出其他任何内容。",
+            )
+            p1_text, err = self._call([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": ack_content},
+            ])
             if err or self._abort:
                 return
 
-            # Call 2: remaining images + final prompt
-            messages = [
+            p2_text, err = self._call([
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": img_content_1},
+                {"role": "user", "content": ack_content},
                 {"role": "assistant", "content": p1_text},
-            ]
-            img_content_2 = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}} for b64 in remaining]
-            img_content_2.append({"type": "text", "text": "请继续识别剩余试卷图片内容。结合之前已经识别的内容，输出完整JSON。"})
-
-            messages.append({"role": "user", "content": img_content_2})
-            p2_payload = {
-                "model": self.model["model_name"],
-                "messages": messages,
-                "temperature": 0.3,
-                "stream": True,
-            }
-            p2_payload["thinking"] = thinking_kv
-
-            p2_text, err = self._stream_call(url, p2_payload, headers)
+                {"role": "user", "content": image_content(
+                    remaining,
+                    "请继续识别剩余试卷图片内容。结合之前已经识别的内容，输出完整JSON。",
+                )},
+            ])
             if err or self._abort:
                 return
             self.finished_signal.emit(p2_text)
 
         else:
-            # Split mode: OCR text, two calls with shared session
-            prompt = PDF_SYSTEM_PROMPT
-            full_text = self.data  # this is the OCR text string
-
-            # Call 1: source + listening + reading + seven_choices
-            p1_messages = [
-                {"role": "system", "content": prompt},
+            # Split mode: OCR text, two calls with a shared session.
+            full_text = self.data
+            base_messages = [
+                {"role": "system", "content": PDF_SYSTEM_PROMPT},
                 {"role": "user", "content": f"试卷内容：\n{full_text}\n\n请提取并返回 source、listening、reading、seven_choices 部分的JSON。只输出JSON，不要其他内容。"},
             ]
-            p1_payload = {
-                "model": self.model["model_name"],
-                "messages": p1_messages,
-                "temperature": 0.3,
-                "stream": True,
-            }
-            p1_payload["thinking"] = thinking_kv
 
-            p1_text, err = self._stream_call(url, p1_payload, headers)
+            p1_text, err = self._call(base_messages)
             if err or self._abort:
                 return
 
-            # Call 2: cloze + grammar + writing + continuation
-            p2_messages = p1_messages + [
+            p2_text, err = self._call(base_messages + [
                 {"role": "assistant", "content": p1_text},
                 {"role": "user", "content": "请继续提取并返回 cloze、grammar、writing、continuation 部分的JSON。只输出JSON，不要其他内容。"},
-            ]
-            p2_payload = {
-                "model": self.model["model_name"],
-                "messages": p2_messages,
-                "temperature": 0.3,
-                "stream": True,
-            }
-            p2_payload["thinking"] = thinking_kv
-
-            p2_text, err = self._stream_call(url, p2_payload, headers)
+            ])
             if err or self._abort:
                 return
 
-            # Merge both parts using the robust extract_json
             part1, err1 = extract_json(p1_text)
             if err1:
                 self.error_signal.emit("第一批 JSON 解析失败: " + err1)
@@ -609,10 +468,29 @@ class SplitPdfWorker(QThread):
             self.finished_signal.emit(json.dumps(combined, ensure_ascii=False))
 
 
+class NetworkProbe(QThread):
+    """Run a blocking network check off the GUI thread."""
+
+    result = Signal(str)
+
+    def __init__(self, func, parent=None):
+        super().__init__(parent)
+        self._func = func
+
+    def run(self):
+        try:
+            self.result.emit(self._func())
+        except Exception as exc:  # defensive: never let a probe thread die silently
+            self.result.emit(json.dumps({"ok": False, "detail": str(exc)[:300]}))
+
+
 class ApiBridge(QObject):
     toastMessage = Signal(str, str)
     modelsChanged = Signal()
     ocrConfigChanged = Signal()
+
+    modelTested = Signal(str, str)  # model_id, JSON result
+    ocrTested = Signal(str)         # JSON result
 
     writingChunk = Signal(str)
     writingDone = Signal(str)
@@ -637,26 +515,40 @@ class ApiBridge(QObject):
     pdfDone = Signal(str)
     pdfError = Signal(str)
 
-    phoneConnected = Signal()
-    phoneDisconnected = Signal()
     phoneImageReceived = Signal(str)
     phoneImagesChanged = Signal()
     phoneStartRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._probes = []
         self._sse_worker = None
         self._asr_worker = None
         self._ocr_worker = None
         self._pdf_img_worker = None
-        self._last_pdf_result = {}
-        self._tmp_files = {}
         self._phone_server = PhoneServer(self)
-        self._phone_server.phoneConnected.connect(self.phoneConnected.emit)
-        self._phone_server.phoneDisconnected.connect(self.phoneDisconnected.emit)
         self._phone_server.imageReceived.connect(self.phoneImageReceived.emit)
         self._phone_server.imagesChanged.connect(self.phoneImagesChanged.emit)
         self._phone_server.startRequested.connect(self.phoneStartRequested.emit)
+
+    @staticmethod
+    def _stop_worker(worker, timeout_ms=5000):
+        if not worker or not worker.isRunning():
+            return True
+        abort = getattr(worker, "abort", None)
+        if abort:
+            abort()
+        return worker.wait(timeout_ms)
+
+    def shutdown(self):
+        self._phone_server.stopServer()
+        for worker in (
+            self._sse_worker, self._asr_worker, self._ocr_worker, self._pdf_img_worker,
+            *self._probes,
+        ):
+            if worker and not self._stop_worker(worker, timeout_ms=1500):
+                worker.terminate()
+                worker.wait(1000)
 
     @Slot(result=str)
     def getModelsJson(self):
@@ -666,7 +558,7 @@ class ApiBridge(QObject):
     def addModel(self, alias, base_url, model_name, api_key, thinking_enabled, vision_enabled):
         models = load_models()
         new_model = {
-            "id": str(int(time.time() * 1000)),
+            "id": uuid.uuid4().hex,
             "alias": alias.strip(),
             "base_url": base_url.strip(),
             "model_name": model_name.strip(),
@@ -703,45 +595,54 @@ class ApiBridge(QObject):
         self.modelsChanged.emit()
         return True
 
-    @Slot(str, result=str)
+    @Slot(str)
     def testModel(self, model_id):
+        """Probe a model's endpoint in the background; result via ``modelTested``."""
         models = load_models()
         model = next((m for m in models if m["id"] == model_id), None)
         if not model:
-            return json.dumps({"ok": False, "detail": "not found"})
+            self.modelTested.emit(model_id, json.dumps({"ok": False, "detail": "模型不存在"}))
+            return
 
-        base_url = model["base_url"].rstrip("/")
-        url = f"{base_url}/chat/completions"
-        payload = json.dumps({
-            "model": model["model_name"],
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 5,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {model['api_key']}",
-            },
-            method="POST",
-        )
-
-        try:
-            start = time.time()
-            resp = urllib.request.urlopen(req, timeout=15)
-            elapsed = round((time.time() - start) * 1000)
-            body = json.loads(resp.read().decode("utf-8"))
-            return json.dumps({"ok": True, "elapsed_ms": elapsed, "model": body.get("model", "")})
-        except urllib.error.HTTPError as e:
-            err_body = ""
+        def probe():
+            base_url = validate_http_url(model["base_url"])
+            url = f"{base_url}/chat/completions"
+            payload = {
+                "model": model["model_name"],
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 5,
+            }
             try:
-                err_body = e.read().decode("utf-8")[:300]
-            except Exception:
-                pass
-            return json.dumps({"ok": False, "status": e.code, "detail": err_body})
-        except Exception as e:
-            return json.dumps({"ok": False, "detail": str(e)[:300]})
+                start = time.time()
+                resp = requests.post(
+                    url, json=payload,
+                    headers={"Authorization": f"Bearer {model['api_key']}"},
+                    timeout=15,
+                )
+                elapsed = round((time.time() - start) * 1000)
+                resp.raise_for_status()
+                body = resp.json()
+                return json.dumps({
+                    "ok": True, "elapsed_ms": elapsed, "model": body.get("model", ""),
+                })
+            except requests.HTTPError as exc:
+                response = exc.response
+                return json.dumps({
+                    "ok": False,
+                    "status": response.status_code if response is not None else 0,
+                    "detail": response.text[:300] if response is not None else str(exc)[:300],
+                })
+            except Exception as e:
+                return json.dumps({"ok": False, "detail": str(e)[:300]})
+
+        self._run_probe(probe, lambda payload: self.modelTested.emit(model_id, payload))
+
+    def _run_probe(self, func, on_result):
+        worker = NetworkProbe(func, self)
+        worker.result.connect(on_result)
+        worker.finished.connect(lambda: self._probes.remove(worker) if worker in self._probes else None)
+        self._probes.append(worker)
+        worker.start()
 
     @Slot(result=str)
     def getOcrConfig(self):
@@ -750,20 +651,26 @@ class ApiBridge(QObject):
     @Slot(str, str)
     def saveOcrConfig(self, host, port):
         config = load_config()
-        config["ocr_host"] = host or "127.0.0.1"
-        config["ocr_port"] = port or "1224"
+        config["ocr_host"] = host or DEFAULT_CONFIG["ocr_host"]
+        config["ocr_port"] = port or DEFAULT_CONFIG["ocr_port"]
         save_config(config)
         self.ocrConfigChanged.emit()
         self.toastMessage.emit("OCR 配置已保存", "success")
 
-    @Slot(str, result=str)
+    @Slot(str)
     def testOcrConnection(self, url):
-        try:
-            resp = urllib.request.urlopen(url, timeout=8)
-            text = resp.read().decode("utf-8").strip()[:100]
-            return json.dumps({"ok": True, "text": text})
-        except Exception as e:
-            return json.dumps({"ok": False, "detail": str(e)[:200]})
+        """Probe the OCR service in the background; result via ``ocrTested``."""
+        def probe():
+            try:
+                safe_url = validate_http_url(url)
+                resp = requests.get(safe_url, timeout=8)
+                resp.raise_for_status()
+                text = resp.text.strip()[:100]
+                return json.dumps({"ok": True, "text": text})
+            except Exception as e:
+                return json.dumps({"ok": False, "detail": str(e)[:200]})
+
+        self._run_probe(probe, self.ocrTested.emit)
 
     @Slot(str, str, bool, str)
     def startWritingGeneration(self, passage, model_id, thinking_enabled, mode):
@@ -773,50 +680,53 @@ class ApiBridge(QObject):
             self.writingError.emit("模型未找到")
             return
 
-        if self._sse_worker and self._sse_worker.isRunning():
-            self._sse_worker.abort()
-            self._sse_worker.wait(2000)
-
         from .prompts import WRITING_CONTINUATION_PROMPT, WRITING_PRACTICAL_PROMPT
         prompt = WRITING_PRACTICAL_PROMPT if mode == "practical" else WRITING_CONTINUATION_PROMPT
 
-        base_url = model["base_url"].rstrip("/")
-        url = f"{base_url}/chat/completions"
-        payload = {
-            "model": model["model_name"],
-            "messages": [
+        url, payload, headers = build_chat_request(
+            model,
+            [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": passage},
             ],
-            "stream": True,
-        }
-        payload["thinking"] = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {model['api_key']}",
-        }
-
-        self._sse_worker = SseWorker(url, payload, headers)
-        self._sse_worker.chunk_received.connect(self.writingChunk.emit)
-        self._sse_worker.finished_signal.connect(self.writingDone.emit)
-        self._sse_worker.error_signal.connect(self.writingError.emit)
-        self._sse_worker.start()
+            thinking_enabled,
+        )
+        self._start_stream(
+            SseWorker(url, payload, headers),
+            self.writingChunk, self.writingDone, self.writingError,
+        )
 
     @Slot()
     def cancelGeneration(self):
-        if self._sse_worker and self._sse_worker.isRunning():
-            self._sse_worker.abort()
-            self._sse_worker.wait(2000)
+        self._stop_worker(self._sse_worker)
+
+    def _start_stream(self, worker, chunk_signal, done_signal, error_signal):
+        """Abort any in-flight stream, wire up signals, and start *worker*."""
+        if not self._stop_worker(self._sse_worker):
+            error_signal.emit("上一项 AI 任务仍在停止，请稍后重试")
+            return
+        worker.chunk_received.connect(chunk_signal.emit)
+        worker.finished_signal.connect(done_signal.emit)
+        worker.error_signal.connect(error_signal.emit)
+        self._sse_worker = worker
+        worker.start()
+
+    def _pick_save_path(self, default_name, filter_str, ext):
+        """Ask for a save path and make sure it carries *ext*. None if cancelled."""
+        filepath = self._ask_save_path(default_name, filter_str)
+        if not filepath:
+            return None
+        if not filepath.endswith(ext):
+            filepath += ext
+        return filepath
 
     @Slot(str, str, result=str)
     def saveWritingDocx(self, content, mode):
         from .export import build_writing_docx
         default_name = "应用文写作思路.docx" if mode == "practical" else "读后续写思路.docx"
-        filepath = self._ask_save_path(default_name, "Word 文档 (*.docx)")
+        filepath = self._pick_save_path(default_name, "Word 文档 (*.docx)", ".docx")
         if not filepath:
             return json.dumps({"ok": False, "cancelled": True})
-        if not filepath.endswith(".docx"):
-            filepath += ".docx"
         try:
             build_writing_docx(content, filepath)
             return json.dumps({"ok": True})
@@ -825,8 +735,9 @@ class ApiBridge(QObject):
 
     @Slot(str, str)
     def startListenAsr(self, filepath, filename):
-        if self._asr_worker and self._asr_worker.isRunning():
-            self._asr_worker.wait(2000)
+        if not self._stop_worker(self._asr_worker):
+            self.asrError.emit("上一项转写任务仍在停止，请稍后重试")
+            return
 
         self._asr_worker = AsrWorker(filepath)
         self._asr_worker.progress.connect(self.asrProgress.emit)
@@ -842,38 +753,25 @@ class ApiBridge(QObject):
             self.listeningError.emit("模型未找到")
             return
 
-        if self._sse_worker and self._sse_worker.isRunning():
-            self._sse_worker.abort()
-            self._sse_worker.wait(2000)
-
         from .prompts import LISTENING_SYSTEM_PROMPT
-        base_url = model["base_url"].rstrip("/")
-        url = f"{base_url}/chat/completions"
-        payload = {
-            "model": model["model_name"],
-            "messages": [
+        url, payload, headers = build_chat_request(
+            model,
+            [
                 {"role": "system", "content": LISTENING_SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
-            "temperature": 0.3,
-            "stream": True,
-        }
-        payload["thinking"] = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {model['api_key']}",
-        }
-
-        self._sse_worker = SseWorker(url, payload, headers)
-        self._sse_worker.chunk_received.connect(self.listeningChunk.emit)
-        self._sse_worker.finished_signal.connect(self.listeningDone.emit)
-        self._sse_worker.error_signal.connect(self.listeningError.emit)
-        self._sse_worker.start()
+            thinking_enabled,
+            temperature=0.3,
+        )
+        self._start_stream(
+            SseWorker(url, payload, headers),
+            self.listeningChunk, self.listeningDone, self.listeningError,
+        )
 
     @Slot(str, str, result=str)
-    def saveListeningDocx(self, json_str, filename):
+    def saveListeningDocx(self, content, filename):
         from .export import build_listening_docx
-        data, err = self._extract_json(json_str)
+        data, err = extract_json(content)
         if err:
             return json.dumps({"ok": False, "error": err})
 
@@ -881,11 +779,9 @@ class ApiBridge(QObject):
         if not save_filename.endswith(".docx"):
             save_filename = save_filename.rsplit(".", 1)[0] + ".docx"
 
-        filepath = self._ask_save_path(save_filename, "Word 文档 (*.docx)")
+        filepath = self._pick_save_path(save_filename, "Word 文档 (*.docx)", ".docx")
         if not filepath:
             return json.dumps({"ok": False, "cancelled": True})
-        if not filepath.endswith(".docx"):
-            filepath += ".docx"
         try:
             build_listening_docx(data, filepath)
             return json.dumps({"ok": True})
@@ -895,11 +791,12 @@ class ApiBridge(QObject):
     @Slot(str, result=str)
     def startPdfOcr(self, filepath):
         config = load_config()
-        host = config.get("ocr_host", "127.0.0.1")
-        port = config.get("ocr_port", "1224")
+        host = config["ocr_host"]
+        port = config["ocr_port"]
 
-        if self._ocr_worker and self._ocr_worker.isRunning():
-            self._ocr_worker.wait(2000)
+        if not self._stop_worker(self._ocr_worker):
+            self.ocrError.emit("上一项 OCR 任务仍在停止，请稍后重试")
+            return json.dumps({"ok": False})
 
         self._ocr_worker = OcrWorker(filepath, host, port)
         self._ocr_worker.progress.connect(self.ocrProgress.emit)
@@ -910,8 +807,9 @@ class ApiBridge(QObject):
 
     @Slot(str, result=str)
     def startPdfToImages(self, filepath):
-        if self._pdf_img_worker and self._pdf_img_worker.isRunning():
-            self._pdf_img_worker.wait(2000)
+        if not self._stop_worker(self._pdf_img_worker):
+            self.pdfToImagesError.emit("上一项 PDF 转换任务仍在停止，请稍后重试")
+            return json.dumps({"ok": False})
 
         self._pdf_img_worker = PdfToImagesWorker(filepath)
         self._pdf_img_worker.done.connect(self.pdfToImagesDone.emit)
@@ -927,41 +825,26 @@ class ApiBridge(QObject):
             self.pdfError.emit("模型未找到")
             return
 
-        if self._sse_worker and self._sse_worker.isRunning():
-            self._sse_worker.abort()
-            self._sse_worker.wait(2000)
-
         pages = json.loads(pages_json)
         full_text = "\n\n".join(pages)
 
         from .prompts import PDF_SYSTEM_PROMPT
-        base_url = model["base_url"].rstrip("/")
 
         if split_mode:
-            self._sse_worker = SplitPdfWorker(base_url, model, full_text, thinking_enabled, is_vision=False)
+            worker = SplitPdfWorker(model, full_text, thinking_enabled, is_vision=False)
         else:
-            url = f"{base_url}/chat/completions"
-            thinking_kv = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
-            payload = {
-                "model": model["model_name"],
-                "messages": [
+            url, payload, headers = build_chat_request(
+                model,
+                [
                     {"role": "system", "content": PDF_SYSTEM_PROMPT},
                     {"role": "user", "content": f"试卷内容：\n{full_text}\n\n请一次性输出完整JSON。"},
                 ],
-                "temperature": 0.3,
-                "stream": True,
-            }
-            payload["thinking"] = thinking_kv
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {model['api_key']}",
-            }
-            self._sse_worker = SseWorker(url, payload, headers)
+                thinking_enabled,
+                temperature=0.3,
+            )
+            worker = SseWorker(url, payload, headers)
 
-        self._sse_worker.chunk_received.connect(self.pdfChunk.emit)
-        self._sse_worker.finished_signal.connect(self.pdfDone.emit)
-        self._sse_worker.error_signal.connect(self.pdfError.emit)
-        self._sse_worker.start()
+        self._start_stream(worker, self.pdfChunk, self.pdfDone, self.pdfError)
 
     @Slot(str, str, bool, bool)
     def startVisionGeneration(self, images_json, model_id, thinking_enabled, batch_mode):
@@ -971,130 +854,85 @@ class ApiBridge(QObject):
             self.pdfError.emit("模型未找到")
             return
 
-        if self._sse_worker and self._sse_worker.isRunning():
-            self._sse_worker.abort()
-            self._sse_worker.wait(2000)
-
         images = json.loads(images_json)
         from .prompts import PDF_VISION_PROMPT
-        base_url = model["base_url"].rstrip("/")
 
         if batch_mode and len(images) > 9:
-            self._sse_worker = SplitPdfWorker(base_url, model, images, thinking_enabled, is_vision=True)
+            worker = SplitPdfWorker(model, images, thinking_enabled, is_vision=True)
         else:
-            url = f"{base_url}/chat/completions"
-            content = []
-            for b64 in images:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                })
-            content.append({"type": "text", "text": "请识别以上试卷图片内容，一次性输出完整JSON。"})
-
-            payload = {
-                "model": model["model_name"],
-                "messages": [
+            url, payload, headers = build_chat_request(
+                model,
+                [
                     {"role": "system", "content": PDF_VISION_PROMPT},
-                    {"role": "user", "content": content},
+                    {"role": "user", "content": image_content(
+                        images, "请识别以上试卷图片内容，一次性输出完整JSON。"
+                    )},
                 ],
-                "temperature": 0.3,
-                "stream": True,
-            }
-            payload["thinking"] = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {model['api_key']}",
-            }
-            self._sse_worker = SseWorker(url, payload, headers)
+                thinking_enabled,
+                temperature=0.3,
+            )
+            worker = SseWorker(url, payload, headers)
 
-        self._sse_worker.chunk_received.connect(self.pdfChunk.emit)
-        self._sse_worker.finished_signal.connect(self.pdfDone.emit)
-        self._sse_worker.error_signal.connect(self.pdfError.emit)
-        self._sse_worker.start()
-
-    def _extract_json(self, text):
-        return extract_json(text)
+        self._start_stream(worker, self.pdfChunk, self.pdfDone, self.pdfError)
 
     @Slot(str, result=str)
-    def savePdfDocx(self, json_str):
+    def savePdfDocx(self, content):
         from .export import build_pdf_docx
-        data, err = self._extract_json(json_str)
+        data, err = extract_json(content)
         if err:
             return json.dumps({"ok": False, "error": err})
 
         source = data.get("source", "")
         save_filename = (source + "英语.docx") if source else "英语试卷.docx"
-
-        filepath = self._ask_save_path(save_filename, "Word 文档 (*.docx)")
+        filepath = self._pick_save_path(save_filename, "Word 文档 (*.docx)", ".docx")
         if not filepath:
             return json.dumps({"ok": False, "cancelled": True})
-        if not filepath.endswith(".docx"):
-            filepath += ".docx"
         try:
             build_pdf_docx(data, filepath)
             return json.dumps({"ok": True})
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             return json.dumps({"ok": False, "error": str(e)[:300]})
 
     @Slot(str, result=str)
-    @Slot(str, result=str)
-    def savePdfPptx(self, json_str):
+    def savePdfPptx(self, content):
         from .export import build_pdf_pptx
-        print(f"[PPT DEBUG] Raw input (first 500 chars): {json_str[:500] if json_str else 'EMPTY'}")
-        data, err = self._extract_json(json_str)
+        data, err = extract_json(content)
         if err:
             return json.dumps({"ok": False, "error": err})
 
         source = data.get("source", "")
         save_filename = (source + "英语.pptx") if source else "英语试卷.pptx"
-
-        filepath = self._ask_save_path(save_filename, "PPT 文档 (*.pptx)")
+        filepath = self._pick_save_path(save_filename, "PPT 文档 (*.pptx)", ".pptx")
         if not filepath:
             return json.dumps({"ok": False, "cancelled": True})
-        if not filepath.endswith(".pptx"):
-            filepath += ".pptx"
-        print(f"[PPT DEBUG] data keys: {list(data.keys())}, output={filepath}")
         try:
             build_pdf_pptx(data, filepath)
             return json.dumps({"ok": True})
         except IndexError as e:
-            import traceback
-            print(f"[PPT DEBUG] IndexError traceback:")
-            traceback.print_exc()
-            return json.dumps({"ok": False, "error": "PPT模板错误: " + str(e) })
+            return json.dumps({"ok": False, "error": "PPT模板错误: " + str(e)})
         except Exception as e:
-            import traceback
-            print(f"[PPT DEBUG] Exception traceback:")
-            traceback.print_exc()
             return json.dumps({"ok": False, "error": str(e)[:300]})
 
 
     @Slot(result=bool)
     def startPhoneServer(self):
-        """Start the phone connection server."""
+        """Start the phone HTTP upload server."""
         return self._phone_server.startServer()
 
     @Slot()
     def stopPhoneServer(self):
-        """Stop the phone connection server."""
+        """Stop the phone HTTP upload server."""
         self._phone_server.stopServer()
 
     @Slot(result=str)
-    def getPhoneLanIp(self):
-        """Return the desktop LAN IP for the phone to connect to."""
-        return self._phone_server.getLanIp()
+    def getPhoneConnectionUrl(self):
+        """Return the token-protected phone upload URL."""
+        return self._phone_server.getConnectionUrl()
 
     @Slot(result=str)
     def getPhoneNetworkName(self):
         """Return the name of the connected Wi-Fi network."""
         return self._phone_server.getNetworkName()
-
-    @Slot(result=bool)
-    def isPhoneConnected(self):
-        """Return whether a phone is currently connected."""
-        return self._phone_server.isPhoneConnected()
 
     @Slot(result=str)
     def getPhoneImagesJson(self):
@@ -1106,62 +944,32 @@ class ApiBridge(QObject):
         """Return current temp file paths as a JSON array."""
         return self._phone_server.getImagePathsJson()
 
-    @Slot(result=int)
-    def getPhoneImageCount(self):
-        """Return the number of phone-uploaded images."""
-        return self._phone_server.getImageCount()
-
     @Slot(int)
     def deletePhoneImage(self, index):
-        self._phone_server.deleteImage(index, sync_to_phone=True)
+        self._phone_server.deleteImage(index)
 
     @Slot(int, int)
     def movePhoneImage(self, from_index, to_index):
-        self._phone_server.moveImage(from_index, to_index, sync_to_phone=True)
+        self._phone_server.moveImage(from_index, to_index)
 
-    @Slot()
-    def proceedOnPhone(self):
-        """Tell the connected phone to move to the completion screen."""
-        self._phone_server.notifyProceed()
-
-    @Slot()
-    def notifyPhoneProcessingStarted(self):
-        """Notify the phone that AI processing has started."""
-        self._phone_server.notifyProcessingStarted()
-
-    @Slot()
-    def notifyPhoneProcessingComplete(self):
-        """Notify the phone that AI processing has finished."""
-        self._phone_server.notifyProcessingComplete()
+    @staticmethod
+    def _dialog_parent():
+        """Return the active window so native dialogs stay attached to it."""
+        from PySide6.QtWidgets import QApplication
+        return QApplication.activeWindow()
 
     @Slot(str, result=str)
     def openFileDialog(self, filter_str):
         """Open a file picker and return the selected path, or empty string if cancelled."""
         from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(None, "选择文件", "", filter_str)
+        path, _ = QFileDialog.getOpenFileName(
+            self._dialog_parent(), "选择文件", "", filter_str
+        )
         return path if path else ""
-
-    @Slot(str, result=str)
-    def saveTempFile(self, data_b64):
-        tmpdir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tmp")
-        os.makedirs(tmpdir, exist_ok=True)
-        task_id = hashlib.md5(f"tmp{time.time()}".encode()).hexdigest()[:12]
-        filepath = os.path.join(tmpdir, f"{task_id}.tmp")
-        import base64 as b64
-        with open(filepath, "wb") as f:
-            f.write(b64.b64decode(data_b64))
-        self._tmp_files[task_id] = filepath
-        return filepath
-
-    @Slot(str)
-    def cleanupTempFile(self, filepath):
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception:
-            pass
 
     def _ask_save_path(self, default_name, filter_str):
         from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(None, "保存文件", default_name, filter_str)
+        path, _ = QFileDialog.getSaveFileName(
+            self._dialog_parent(), "保存文件", default_name, filter_str
+        )
         return path if path else ""
