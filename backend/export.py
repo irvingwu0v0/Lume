@@ -1,6 +1,11 @@
 """Shared export utilities: docx/pptx builders and common helpers."""
 
-import copy, os, re, sys
+import copy
+import json
+import logging
+import os
+import re
+
 from docx import Document
 from docx.shared import Cm, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -9,29 +14,28 @@ from docx.oxml import OxmlElement
 from lxml import etree
 from pptx import Presentation
 from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches as PptInches, Cm as PptCm, Pt as PptPt, Emu
-from pptx.dml.color import RGBColor as PptRGBColor
-from pptx.oxml.ns import qn as pptx_qn
+from pptx.util import Emu
+
+logger = logging.getLogger(__name__)
 # ── Shared Constants ──────────────────────────────────────
 
-PPT_SHAPE_CACHE = {}
-PPT_TEMPLATE = "templates/ppt_template.pptx"
 TNR = "Times New Roman"
 FZ_ST = "方正书宋_GBK"
 FZ_HT = "方正黑体_GBK"
 FZ_KT = "方正楷体_GBK"
 FZ_XBS = "方正小标宋简体"
-CN_FONTS = ["方正书宋_GBK", "宋体", "SimSun"]
 
 X2 = Pt(18)     # 小二号
 X4 = Pt(12)     # 小四号
 W5 = Pt(10.5)   # 五号
+P12 = Pt(12)
+BLACK = RGBColor(0, 0, 0)
 
 
 # ── Shared Helpers ────────────────────────────────────────
 
 
-def _set_run_font(run, latin=TNR, ea=FZ_ST, size=W5, color=RGBColor(0, 0, 0)):
+def _set_run_font(run, latin=TNR, ea=FZ_ST, size=W5, color=BLACK):
     """Set Latin + East-Asian fonts on a run via XML."""
     run.font.name = latin
     run.font.size = size
@@ -94,6 +98,12 @@ def _setup_default_style(doc):
     pf.line_spacing = 1.5
 
 
+def _add_footer_run(paragraph, text):
+    run = paragraph.add_run(text)
+    _set_run_font(run, size=Pt(9))
+    return run
+
+
 def _add_page_header_footer(doc, label):
     """Add centered header and PAGE/NUMPAGES footer to all sections."""
     for section in doc.sections:
@@ -111,12 +121,7 @@ def _add_page_header_footer(doc, label):
         fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _set_paragraph_spacing(fp)
 
-        def _add_fp_run(text):
-            r = fp.add_run(text)
-            _set_run_font(r, size=Pt(9))
-            return r
-
-        _add_fp_run(f"{label} 第")
+        _add_footer_run(fp, f"{label} 第")
         fld1 = OxmlElement("w:fldChar")
         fld1.set(qn("w:fldCharType"), "begin")
         r1 = fp.add_run(); r1._element.append(fld1)
@@ -126,7 +131,7 @@ def _add_page_header_footer(doc, label):
         fld2 = OxmlElement("w:fldChar")
         fld2.set(qn("w:fldCharType"), "end")
         r3 = fp.add_run(); r3._element.append(fld2)
-        _add_fp_run(" 页 / 共 ")
+        _add_footer_run(fp, " 页 / 共 ")
         fld3 = OxmlElement("w:fldChar")
         fld3.set(qn("w:fldCharType"), "begin")
         r4 = fp.add_run(); r4._element.append(fld3)
@@ -136,13 +141,13 @@ def _add_page_header_footer(doc, label):
         fld4 = OxmlElement("w:fldChar")
         fld4.set(qn("w:fldCharType"), "end")
         r6 = fp.add_run(); r6._element.append(fld4)
-        _add_fp_run(" 页")
+        _add_footer_run(fp, " 页")
 
 
 # ── Writing Helpers (markdown → docx) ────────────────────
 
 
-def _add_inline_paragraph(doc, text, bold=False, size=Pt(12), alignment=None, style_name=None):
+def _add_inline_paragraph(doc, text, bold=False, size=P12, alignment=None, style_name=None):
     """Add a paragraph, parsing **bold** and *italic* inline markers."""
     if style_name:
         p = doc.add_paragraph(style=style_name)
@@ -451,20 +456,10 @@ def _add_underline_line(doc):
 
 
 
-"""
-build_pptx.py — Fill 模板.pptx with exam JSON data.
-
-Usage:
-  python build_pptx.py                  # reads data.json in same dir
-  python build_pptx.py some_exam.json   # reads given JSON
-"""
-
-import copy, json, os, re, sys
-from lxml import etree
-from pptx import Presentation
-from pptx.util import Pt, Emu
+# PPTX layout section (formerly the standalone build_pptx.py):
+# constants and helpers used by build_pdf_pptx below.
+from pptx.util import Pt
 from pptx.dml.color import RGBColor as _PptRGB
-from pptx.enum.text import PP_ALIGN
 
 # ── Paths ────────────────────────────────────────────────────
 
@@ -546,13 +541,15 @@ def _pack_opts(options):
     """
     n = len(options)
     letters = [chr(65 + i) for i in range(n)]
-    opts_w = [_opt_text_width(f"{l}. {t}") for l, t in zip(letters, options)]
+    opts_w = [_opt_text_width(f"{l}. {t}") for l, t in zip(letters, options, strict=True)]
 
     # Try 4-col: all 4 must fit and each within its column
     if n == 4:
         if (_INDENT_W + opts_w[0] <= _COL_W4 and
             all(opts_w[j] <= _COL_W4 for j in range(1, 4))):
-            txt = OPT_INDENT + "\t".join(f"{l}. {t}" for l, t in zip(letters, options))
+            txt = OPT_INDENT + "\t".join(
+                f"{l}. {t}" for l, t in zip(letters, options, strict=True)
+            )
             return [(txt, 4)]
 
     # Try 2-col: each pair must fit and each option within half-width
@@ -578,7 +575,10 @@ def _pack_opts(options):
             return rows
 
     # Fallback: 1 per row
-    return [(OPT_INDENT + f"{l}. {t}", 1) for l, t in zip(letters, options)]
+    return [
+        (OPT_INDENT + f"{l}. {t}", 1)
+        for l, t in zip(letters, options, strict=True)
+    ]
 
 # Template index map
 T = {"title": 0, "reading": 1, "seven": 2, "cloze": 3,
@@ -639,7 +639,7 @@ def _find(slide, name):
         if s.name == name:
             return s
     available = [s.name for s in slide.shapes]
-    print(f"[PPT DEBUG] _find '{name}' NOT FOUND. Available: {available}")
+    logger.debug("PPT shape %r not found; available: %s", name, available)
     return None
 
 
@@ -740,7 +740,7 @@ def _set_body(slide, text, left=None, top=None, width=None, height=None):
 
 
 def _set_side(slide, text, shape_name, left=None, top=None, width=None, height=None, font_size=None, line_sp=None, tab_stops=None):
-    print(f"[PPT DEBUG] _set_side shape='{shape_name}', text_len={len(text) if text else 0}")
+    logger.debug("PPT side shape=%r text_len=%d", shape_name, len(text) if text else 0)
     s = _find(slide, shape_name)
     if s:
         if left is not None: s.left = Emu(left)
@@ -859,18 +859,20 @@ def _set_questions(slide, lines):
 # ── Slide clone / delete ─────────────────────────────────────
 
 def _clone(prs, template_idx):
-    print(f"[PPT DEBUG] _clone template_idx={template_idx}, total_slides={len(prs.slides)}")
+    logger.debug("PPT clone template=%d total_slides=%d", template_idx, len(prs.slides))
     src = prs.slides[template_idx]
     layout = src.slide_layout
     new_slide = prs.slides.add_slide(layout)
     for s in list(new_slide.shapes):
         s._element.getparent().remove(s._element)
-    print(f"[PPT DEBUG] _clone copying {len(src.shapes)} shapes from template #{template_idx}")
+    logger.debug("PPT copying %d shapes from template %d", len(src.shapes), template_idx)
     for s in src.shapes:
         try:
             new_slide.shapes._spTree.append(copy.deepcopy(s._element))
         except Exception as e:
-            print(f"[PPT DEBUG] _clone WARNING: failed to copy shape '{s.name}' (type={s.shape_type}): {e}")
+            logger.warning(
+                "failed to copy PPT shape %r (type=%s): %s", s.name, s.shape_type, e
+            )
     for _, rel in src.part.rels.items():
         if "image" in rel.reltype or "media" in rel.reltype:
             try:
@@ -881,7 +883,7 @@ def _clone(prs, template_idx):
 
 
 def _delete_template_slides(prs, count=TEMPLATE_COUNT):
-    print(f"[PPT DEBUG] _delete_template_slides count={count}, current_slides={len(prs.slides)}")
+    logger.debug("PPT deleting %d templates from %d slides", count, len(prs.slides))
     ns = {"r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
     for _ in range(count):
         sld = prs.slides._sldIdLst[0]
@@ -906,7 +908,7 @@ def _fill(slide, title, body, side_text=None, side_shape=None):
 def _gen_section(prs, template_idx, title, text, side_text=None, side_shape=None):
     chunks = _split_body(text)
     slides = []
-    for ci, chunk in enumerate(chunks):
+    for chunk in chunks:
         cside = side_text
         s = _clone(prs, template_idx)
         _fill(s, title, chunk, side_text=cside, side_shape=side_shape)
@@ -1207,7 +1209,7 @@ def _set_continuation_prompts(slide, data):
 
     # 3. Format prompts
     prompts = data.get("format", [])
-    for pi, prompt in enumerate(prompts):
+    for prompt in prompts:
         # Prompt hint line (indent)
         p = tf.add_paragraph()
         p.alignment = _ALIGN.JUSTIFY
@@ -1244,7 +1246,10 @@ def _fmt_listening(data):
 # ── Main pipeline ────────────────────────────────────────────
 
 def build_pdf_pptx(json_data=None, output_path=None):
-    print(f"[PPT DEBUG] Building PPTX, data keys: {list(json_data.keys()) if isinstance(json_data, dict) else type(json_data)}")
+    logger.debug(
+        "building PPTX with keys=%s",
+        list(json_data) if isinstance(json_data, dict) else type(json_data),
+    )
     # ── Load data ──
     if json_data is None:
         with open(DEFAULT_JSON, "r", encoding="utf-8") as f:
@@ -1256,10 +1261,10 @@ def build_pdf_pptx(json_data=None, output_path=None):
         data = json_data
 
     prs = Presentation(TEMPLATE)
-    print(f"[PPT DEBUG] Template loaded: {len(prs.slides)} slides")
+    logger.debug("PPT template loaded with %d slides", len(prs.slides))
 
     # ── Title slide ──
-    print("[PPT DEBUG] Cloning title slide...")
+    logger.debug("cloning PPT title slide")
     title_slide = _clone(prs, T["title"])
     tb = _find(title_slide, "TextBox 6")
     if tb:
@@ -1306,7 +1311,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
                 slides_lines.append(cur)
             for lines in slides_lines:
                 s = _clone(prs, T["reading"])
-                print(f"[PPT DEBUG] Cloned reading slide for {pk}")
+                logger.debug("cloned reading slide for %s", pk)
                 _set_title(s, label)
                 _set_questions(s, lines)
         qid += len(p.get("questions", []))
@@ -1356,7 +1361,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
             chunks.append("\n".join(cur))
 
         for chunk in chunks:
-            print("[PPT DEBUG] Cloning seven_choices slide...")
+            logger.debug("cloning seven-choices slide")
             s = _clone(prs, T["seven"])
             _set_title(s, "七选五")
             _set_body(s, chunk,
@@ -1370,7 +1375,6 @@ def build_pdf_pptx(json_data=None, output_path=None):
     # ── Cloze ──
     cloze_data = data.get("cloze")
     if cloze_data:
-        import re as _re_cloze
         text = _strip_md(cloze_data.get("text", ""))
         opts_list = cloze_data.get("options", [])
         parsed = _parse_cloze_blanks(text)
@@ -1405,12 +1409,13 @@ def build_pdf_pptx(json_data=None, output_path=None):
         if cur:
             pages.append((cur_body, cur_blanks))
 
-        print(f"[PPT DEBUG] cloze_data keys: {list(cloze_data.keys())}, opts_list len={len(opts_list)}")
-        print(f"[PPT DEBUG] cloze raw text (first 200): {text[:200]}")
+        logger.debug("cloze keys=%s option_sets=%d", list(cloze_data), len(opts_list))
         parsed = _parse_cloze_blanks(text)
-        print(f"[PPT DEBUG] parsed paragraphs: {len(parsed)}, blanks per para: {[blanks for _, blanks in parsed]}")
+        logger.debug(
+            "cloze paragraphs=%d blanks=%s", len(parsed), [blanks for _, blanks in parsed]
+        )
         for body_lines, blank_nums in pages:
-            print(f"[PPT DEBUG] Cloze page: blank_nums={blank_nums}, body_lines={len(body_lines)}")
+            logger.debug("cloze page blanks=%s body_lines=%d", blank_nums, len(body_lines))
             s = _clone(prs, T["cloze"])
             _set_title(s, "完形填空")
             _set_body(s, "\n".join(body_lines),
@@ -1419,11 +1424,9 @@ def build_pdf_pptx(json_data=None, output_path=None):
             opt_lines = []
             for i, qid in enumerate(sorted(blank_nums)):
                 opt_str = opts_list[i] if i < len(opts_list) else ""
-                print(f"[PPT DEBUG] blank#{i} qid={qid} opt_str={'EMPTY' if not opt_str else opt_str[:60]}")
                 formatted = _fmt_cloze_opt(opt_str, qid)
-                print(f"[PPT DEBUG]   formatted={formatted[:80]}")
                 opt_lines.append(formatted)
-            print(f"[PPT DEBUG] opt_lines count={len(opt_lines)}, shape_names=[{', '.join(s.name for s in s.shapes)}]")
+            logger.debug("cloze option lines=%d", len(opt_lines))
             if opt_lines:
                 _set_side(s, "\n".join(opt_lines), "TextBox 5",
                           left=CLOZE_SIDE_L, top=CLOZE_SIDE_T,
@@ -1435,7 +1438,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
     gram = data.get("grammar")
     if gram:
         for chunk in _split_body(gram.get("text", "")):
-            print("[PPT DEBUG] Cloning grammar slide...")
+            logger.debug("cloning grammar slide")
             s = _clone(prs, T["grammar"])
             _set_title(s, "语法填空")
             _set_body(s, chunk)
@@ -1446,7 +1449,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
         topic = writing.get("topic", "")
         chunks = _split_body(topic)
         for pi, chunk in enumerate(chunks):
-            print("[PPT DEBUG] Cloning writing slide...")
+            logger.debug("cloning writing slide")
             s = _clone(prs, T["writing"])
             _set_title(s, "应用文写作")
             if pi == 0:
@@ -1465,7 +1468,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
             _set_body(s, chunk)
 
         # Continuation prompts (new slide, separate)
-        print("[PPT DEBUG] Cloning continuation slide...")
+        logger.debug("cloning continuation slide")
         s = _clone(prs, T["continuation"])
         _set_title(s, "读后续写")
         _set_continuation_prompts(s, cont)
@@ -1478,7 +1481,7 @@ def build_pdf_pptx(json_data=None, output_path=None):
     # ── Save ──
     out = output_path or OUTPUT
     prs.save(out)
-    print(f"✅ {len(prs.slides)} slides → {os.path.basename(out)}")
+    logger.info("saved %d PPT slides to %s", len(prs.slides), os.path.basename(out))
     return out
 
 
@@ -1737,7 +1740,7 @@ def build_pdf_docx(json_data, filepath):
             label = key[-1].upper()
             _center_label(label)
             _render_text(psg.get("text", ""))
-            for qi, q in enumerate(psg.get("questions", [])):
+            for q in psg.get("questions", []):
                 _eng(f"{q_num}. {q.get('question', '')}", indent=False)
                 _add_options_line(doc, q.get("options", []), 4)
                 q_num += 1
@@ -1825,4 +1828,3 @@ def build_pdf_docx(json_data, filepath):
 
     _add_page_header_footer(doc, "英语试卷")
     doc.save(filepath)
-

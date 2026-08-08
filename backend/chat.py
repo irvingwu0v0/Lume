@@ -6,13 +6,16 @@ construction live in exactly one place.
 """
 
 import json
+from urllib.parse import urlsplit
 
 
-def strip_code_fence(text):
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.split("\n", 1)[-1]
-    return stripped.rstrip("`").strip()
+def validate_http_url(url):
+    """Return a normalized HTTP(S) URL or raise ``ValueError``."""
+    normalized = url.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
+    return normalized
 
 
 def extract_json(text):
@@ -123,7 +126,7 @@ def extract_json(text):
 
 def build_chat_request(model, messages, thinking_enabled=False, temperature=None):
     """Build ``(url, payload, headers)`` for an OpenAI-compatible chat call."""
-    base_url = model["base_url"].rstrip("/")
+    base_url = validate_http_url(model["base_url"])
     url = f"{base_url}/chat/completions"
     payload = {
         "model": model["model_name"],
@@ -132,7 +135,8 @@ def build_chat_request(model, messages, thinking_enabled=False, temperature=None
     }
     if temperature is not None:
         payload["temperature"] = temperature
-    payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+    if thinking_enabled:
+        payload["thinking"] = {"type": "enabled"}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {model['api_key']}",
@@ -155,9 +159,9 @@ def iter_sse_deltas(chunks, should_abort=lambda: False):
         buf += chunk.decode("utf-8", errors="replace")
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            data_str = line[6:].strip()
+            data_str = line[5:].strip()
             if data_str == "[DONE]":
                 return
             try:
