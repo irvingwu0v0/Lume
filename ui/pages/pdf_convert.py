@@ -5,10 +5,10 @@ import json
 import os
 
 import qrcode
-from PySide6.QtCore import QRectF, Qt, QUrl
+from PySide6.QtCore import QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QScrollArea, QStackedWidget,
+    QApplication, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -155,9 +155,14 @@ class PdfConvertPage(Page):
         layout.addWidget(self.mode_control)
 
         self.upload_stack = QStackedWidget()
+        self.upload_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.upload_stack.addWidget(self._build_pdf_panel())
         self.upload_stack.addWidget(self._build_phone_panel())
+        self.upload_stack.currentChanged.connect(self._schedule_upload_stack_resize)
         layout.addWidget(self.upload_stack)
+        self._schedule_upload_stack_resize()
 
         footer = QHBoxLayout()
         footer.addStretch(1)
@@ -433,7 +438,19 @@ class PdfConvertPage(Page):
             self._set_pdf_mode("ocr")
         self.phone_tip.setVisible(self.upload_mode == "phone")
         self.ocr_radio.setVisible(self.upload_mode == "pdf")
+        self._schedule_upload_stack_resize()
         self._update_next_enabled()
+
+    def _schedule_upload_stack_resize(self, *_args):
+        QTimer.singleShot(0, self._resize_upload_stack)
+
+    def _resize_upload_stack(self):
+        panel = self.upload_stack.currentWidget()
+        if panel is None:
+            return
+        panel.updateGeometry()
+        height = max(panel.sizeHint().height(), panel.minimumSizeHint().height())
+        self.upload_stack.setFixedHeight(max(1, height))
 
     def _on_pdf_mode_changed(self, checked):
         if not checked:
@@ -472,6 +489,7 @@ class PdfConvertPage(Page):
             self.pdf_info.setText("")
         self.pdf_drop.set_content("已选择 PDF 文件", "点击此处可重新选择", "circle-check")
         self.pdf_card.setVisible(True)
+        self._schedule_upload_stack_resize()
         self._update_next_enabled()
 
     def _go_step2(self):
@@ -526,6 +544,7 @@ class PdfConvertPage(Page):
         self.thumbs_scroll.setVisible(self.phone_image_count > 0)
         self.phone_empty.setVisible(self.phone_image_count == 0)
         self.count_label.setText(f"{self.phone_image_count} 张已上传")
+        self._schedule_upload_stack_resize()
 
     def _rebuild_thumbnails(self):
         while self.thumbs_layout.count() > 0:
