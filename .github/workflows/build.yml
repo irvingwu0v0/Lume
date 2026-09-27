@@ -1,0 +1,83 @@
+name: Portable builds
+
+# Push a tag like v1.2.0 to build and publish portable archives,
+# or run the workflow manually from the Actions tab.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portable-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            artifact: Lume-Windows
+          # 22.04 keeps the glibc requirement low so the archive runs on
+          # older distributions too.
+          - os: ubuntu-22.04
+            platform: Linux
+            artifact: Lume-Linux
+          - os: macos-latest
+            platform: macOS
+            artifact: Lume-macOS
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build application
+        run: python build.py
+
+      - name: Package portable archive
+        shell: bash
+        run: |
+          DATE=$(date +%Y%m%d)
+          echo "ARCHIVE_DATE=$DATE" >> "$GITHUB_ENV"
+          python scripts/package_release.py --platform "${{ matrix.platform }}" --date "$DATE"
+
+      - name: Show archive
+        shell: bash
+        run: ls -lh release/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
