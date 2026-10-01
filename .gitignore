@@ -50,6 +50,7 @@ coverage.xml
 *.lcov
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations
@@ -221,9 +222,4 @@ __marimo__/
 
 # Lume
 data/
-
-# RinUI
-RinUI/
-
-# 构建产物
 release/
