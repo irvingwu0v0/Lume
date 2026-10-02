@@ -8,7 +8,7 @@ control is styled from the generated style sheet below.
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 
-ACCENT = "#4a82e6"
+ACCENT = "#4f8ef7"
 
 _LIGHT = {
     "window": "#f3f5fa",
@@ -19,7 +19,7 @@ _LIGHT = {
     "text": "#101828",
     "text_secondary": "#475467",
     "text_muted": "#98a2b3",
-    "border": "#e8ebf1",
+    "border": "#e4e7ec",
     "border_strong": "#d0d5dd",
     "accent": ACCENT,
     "accent_hover": "#3d7ce8",
