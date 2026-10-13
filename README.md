@@ -13,6 +13,7 @@
 [![docx](https://img.shields.io/badge/docx-1.0-2b579a?logo=microsoftword&logoColor=fff)](https://python-docx.readthedocs.io)
 [![pptx](https://img.shields.io/badge/pptx-1.0-b7472a?logo=microsoftpowerpoint&logoColor=fff)](https://python-pptx.readthedocs.io)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-6c5ce7)]()
+[![License](https://img.shields.io/badge/license-GPL--3.0-2ea44f?logo=gnu&logoColor=fff)](LICENSE)
 
 > **AI 一键生成英语教学材料 · 写作思路 · 听力文本 · 试卷导出 Word / PPT**
 
@@ -376,7 +377,11 @@ Lume 统一使用 `Fusion` 基础样式 + 自带样式表，正常情况下三�
 
 ## 📜 许可证
 
-当前仓库尚未附带独立的项目许可证文件；在补充许可证前，请勿默认获得复制、修改或再分发本项目源码的授权。内置 Font Awesome 字体仍按 `assets/fonts/LICENSE-FontAwesome.txt` 中的 SIL OFL 1.1 授权。
+本项目以 **GNU General Public License v3.0** 发布，完整条款见 [LICENSE](LICENSE)。
+
+你可以自由使用、修改与再分发本项目；任何基于本项目的衍生作品也必须同样以 GPL-3.0 开源，并保留版权与许可声明。本项目按「原样」提供，不含任何形式的担保。
+
+内置 Font Awesome 字体仍按 `assets/fonts/LICENSE-FontAwesome.txt` 中的 SIL OFL 1.1 授权。
 
 <div align="center">
 <sub>专治英语备课各种麻烦事 · Made with ❤️</sub>
